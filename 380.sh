@@ -31,8 +31,15 @@ T1_TAINT="${T1_TAINT:-maintenance=emergency:NoSchedule}"
 WORKER_SEL="node-role.kubernetes.io/worker"
 
 # --- Task 2: LDAP IdP ---------------------------------------------------------
-T2_IDP_NAME="${T2_IDP_NAME:-ldap}"        # nur informativ
-T2_TESTUSER="${T2_TESTUSER:-ldapuser1}"   # nur informativ
+T2_HOST="${T2_HOST:-idm.ocp4.example.com}"
+T2_BINDDN="${T2_BINDDN:-uid=admin,cn=users,cn=accounts,dc=ocp4,dc=example,dc=com}"
+T2_BINDPW="${T2_BINDPW:-RedHat123@!}"
+T2_BASEDN="${T2_BASEDN:-cn=users,cn=accounts,dc=ocp4,dc=example,dc=com}"
+T2_CA_URL="${T2_CA_URL:-http://idm.ocp4.example.com/ipa/config/ca.crt}"
+T2_CM="${T2_CM:-ldap-ca}"
+T2_SECRET="${T2_SECRET:-ldap-secret}"
+T2_IDP_NAME="${T2_IDP_NAME:-ldap}"
+T2_TESTUSER="${T2_TESTUSER:-ldapuser1}"
 
 # --- Task 3: CSR / kubeconfig / cluster-reader --------------------------------
 T3_USER="${T3_USER:-acme-auditor}"
@@ -52,6 +59,8 @@ T4_SIM_IMAGE="${T4_SIM_IMAGE:-docker.io/library/nginx:1.25}"
 
 # --- Task 5: Logging (Vector/Syslog + EventRouter) -----------------------------
 T5_NS="${T5_NS:-openshift-logging}"
+T5_SYSLOG="${T5_SYSLOG:-tcp://syslog.example.com:514}"
+T5_APPNAME="${T5_APPNAME:-openshift}"
 
 # --- Task 6: GitOps Operator / ArgoCD ------------------------------------------
 T6_NS="${T6_NS:-openshift-gitops}"
@@ -65,6 +74,8 @@ T7_PATH="${T7_PATH:-sshd-motd}"
 T7_MC_MASTER="${T7_MC_MASTER:-71-master-sshd-motd}"
 T7_MC_WORKER="${T7_MC_WORKER:-71-worker-sshd-motd}"
 T7_SSH_CHECK="${T7_SSH_CHECK:-1}"   # 0 = Node-SSH-Check ueberspringen
+T7_REPO="${T7_REPO:-http://git.example.com/ocp-gitops.git}"
+T7_MOTD_URL="${T7_MOTD_URL:-http://materials.example.com/ssh.motd}"
 
 # ============================================================ Helpers =======
 if [ -t 1 ]; then
@@ -133,8 +144,16 @@ setup_1() {
 
 grade_1() {
   hdr "Grade Task 1 - Node Taints"
-  chke "Keine Taints mehr auf Worker-Nodes" \
-    "[ -z \"\$($OC get nodes -l $WORKER_SEL -o jsonpath='{.items[*].spec.taints}')\" ]"
+  local key taints
+  key=${T1_TAINT%%=*}; key=${key%%:*}
+  taints=$($OC get nodes -l "$WORKER_SEL" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.taints[*].key}{"\n"}{end}' 2>/dev/null)
+  chke "Trainings-Taint '$key' von allen Worker-Nodes entfernt" \
+    "! grep -qw -- '$key' <<< '$taints'"
+  if grep -Eq ': .+' <<< "$taints"; then
+    info "Verbleibende Taint-Keys (Standard-Taints wie node-role.* sind ok):"
+    grep -E ': .+' <<< "$taints" | sed 's/^/        /'
+  fi
   chk  "Namespace $T1_NS existiert" $OC get ns "$T1_NS"
   chk  "Deployment $T1_DEPLOY existiert" $OC get deploy "$T1_DEPLOY" -n "$T1_NS"
   chke "$T1_REPLICAS Replicas ready" \
@@ -145,11 +164,19 @@ grade_1() {
 task_2_text() {
 cat <<EOF
   AUFGABE 2 (Authentication / LDAP IdP)
-  Konfigurieren Sie den bestehenden LDAP-Server des Labs als Identity
-  Provider. CA-Zertifikat herunterladen, ConfigMap + Secret in
-  openshift-config anlegen (Namen laut Aufgabenstellung!), OAuth-Cluster-
-  Ressource anpassen. URL-Format: ldaps://HOST/BASEDN?uid  (?uid am Ende!)
-  Verifikation: Login als '$T2_TESTUSER' muss funktionieren.
+  Konfigurieren Sie den LDAP-Server des Labs als Identity Provider.
+  Vorgaben:
+    LDAP-Server:     $T2_HOST (ldaps, Port 636)
+    Bind-DN:         $T2_BINDDN
+    Bind-Passwort:   $T2_BINDPW
+    Base-DN (Suche): $T2_BASEDN
+    Login-Attribut:  uid   => URL-Format: ldaps://HOST/BASE_DN?uid
+    CA-Zertifikat:   $T2_CA_URL
+    ConfigMap:       $T2_CM  (Namespace openshift-config, Key ca.crt)
+    Secret:          $T2_SECRET  (Namespace openshift-config, Key bindPassword)
+    IdP-Name:        $T2_IDP_NAME (mappingMethod: claim)
+  Verifikation: Login als '$T2_TESTUSER' muss funktionieren
+  (danach wieder als admin einloggen!).
 EOF
 }
 
@@ -163,7 +190,7 @@ setup_2() {
   else
     info "Kein Reset ausgefuehrt (FORCE=1 setzen, um IdP-Config zu loeschen)."
   fi
-  info "LDAP-Server selbst kommt aus dem ROL-Lab (z.B. idm.ocp4.example.com)."
+  info "LDAP-Server selbst kommt aus dem ROL-Lab ($T2_HOST - per T2_* Env-Vars anpassbar)."
   task_2_text
 }
 
@@ -200,11 +227,17 @@ grade_2() {
 task_3_text() {
 cat <<EOF
   AUFGABE 3 (Security / Zertifikats-Auth + kubeconfig)
-  Die Firma ACME auditiert den Cluster. Erstellen Sie in '$T3_DIR':
-  Key + CSR (CN=$T3_USER), lassen Sie das Zertifikat vom Cluster signieren
-  (CSR-API, approve), legen Sie die Gruppe '$T3_GROUP' mit dem User an und
-  geben Sie ihr cluster-reader. Bauen Sie ein funktionierendes kubeconfig
-  '$T3_KUBECONFIG' (Zertifikate embedded). Der Auditor darf nur lesen.
+  Die Firma ACME auditiert den Cluster. Richten Sie einen
+  zertifikatsbasierten, rein lesenden Zugang ein.
+  Vorgaben:
+    Arbeitsverzeichnis: $T3_DIR
+    Benutzer (CN):      $T3_USER
+    Key-/CSR-Datei:     tls.key / ${T3_USER}.csr (RSA 4096)
+    CSR-Objekt/Signer:  $T3_USER / kubernetes.io/kube-apiserver-client
+    Gruppe:             $T3_GROUP (Mitglied: $T3_USER)
+    Rolle:              cluster-reader (clusterweit, nur lesen)
+    kubeconfig:         $T3_KUBECONFIG (Zertifikate embedded)
+    API-Server:         \$(oc whoami --show-server)
 EOF
 }
 
@@ -248,10 +281,16 @@ grade_3() {
 task_4_text() {
 cat <<EOF
   AUFGABE 4 (OADP Restore + SCC)
-  Stellen Sie das Projekt '$T4_NS' aus dem vorhandenen Backup
-  '$T4_BACKUP' wieder her (Restore muss Phase Completed erreichen).
-  Die App crasht danach: Beheben Sie das, indem das Deployment
-  '$T4_DEPLOY' mit ServiceAccount '$T4_SA' und SCC '$T4_SCC' laeuft.
+  Stellen Sie ein Projekt aus einem vorhandenen Backup wieder her und
+  beheben Sie den anschliessenden CrashLoop der Datenbank.
+  Vorgaben:
+    OADP-Namespace:     $T4_OADP_NS
+    Backup (existiert): $T4_BACKUP
+    Restore-Objekt:     mariadb-restore  (Phase: Completed)
+    App-Projekt:        $T4_NS
+    Deployment:         $T4_DEPLOY
+    ServiceAccount:     $T4_SA
+    SCC:                $T4_SCC
 EOF
 }
 
@@ -298,11 +337,17 @@ grade_4() {
 task_5_text() {
 cat <<EOF
   AUFGABE 5 (Logging: Vector -> Syslog + EventRouter)
-  Installieren Sie OpenShift Logging (Collector: Vector). Forwarden Sie
-  application-, infrastructure- und audit-Logs an den Syslog-Server des
-  Labs (je eigener Output + Pipeline, Vorgaben fuer appName/procID
-  beachten). Deployen Sie zusaetzlich den EventRouter, damit
-  Kubernetes-Events als application-Logs erfasst werden.
+  Installieren Sie OpenShift Logging und forwarden Sie alle drei
+  Log-Typen an den Syslog-Server des Labs.
+  Vorgaben:
+    Operator/Namespace:    Red Hat OpenShift Logging / $T5_NS
+    Collector:             vector
+    Syslog-Ziel (alle):    $T5_SYSLOG
+    Output application:    Name apps-syslog,  appName $T5_APPNAME, procID app
+    Output infrastructure: Name infra-syslog, appName $T5_APPNAME, procID infra
+    Output audit:          Name audit-syslog, appName $T5_APPNAME, procID audit
+    Pipelines:             je Log-Typ eine eigene Pipeline auf den Output
+    EventRouter:           Deployment eventrouter in $T5_NS (Doku-Template)
 EOF
 }
 
@@ -376,13 +421,17 @@ grade_5() {
 task_6_text() {
 cat <<EOF
   AUFGABE 6 (GitOps Operator / ArgoCD)
-  Installieren Sie den OpenShift-GitOps-Operator (Namespace
-  openshift-gitops-operator, latest channel). Konfigurieren Sie:
-  - ArgoCD-Server-Route mit TLS reencrypt
-  - Gruppe '$T6_GROUP' mit User '$T6_USER'
-  - ArgoCD-RBAC: NUR '$T6_GROUP' hat role:admin
-  - Custom PKI: ConfigMap '$T6_CM' (inject-trusted-cabundle) in den
-    Repo-Server mounten, damit ArgoCD der Cluster-CA vertraut.
+  Installieren und konfigurieren Sie OpenShift GitOps.
+  Vorgaben:
+    Operator-NS/Channel: openshift-gitops-operator / latest
+    Instanz (CR):        argocd/openshift-gitops in $T6_NS
+    Route:               TLS-Termination reencrypt
+    Gruppe/Mitglied:     $T6_GROUP / $T6_USER
+    ArgoCD-RBAC:         NUR 'g, $T6_GROUP, role:admin' (scopes '[groups]')
+    ConfigMap:           $T6_CM mit Label
+                         config.openshift.io/inject-trusted-cabundle=true
+    Mount (Repo-Server): /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+                         (subPath: ca-bundle.crt)
 EOF
 }
 
@@ -439,14 +488,19 @@ grade_6() {
 task_7_text() {
 cat <<EOF
   AUFGABE 7 (MachineConfig via ArgoCD)
-  Deployen Sie /etc/motd (Inhalt von der Lab-URL, mode 0444, overwrite)
-  per MachineConfig auf ALLE Nodes - GitOps-getrieben:
-  - Git-Repo des Labs klonen, im Pfad '$T7_PATH' zwei MachineConfigs
-    anlegen: $T7_MC_MASTER (role: master) und $T7_MC_WORKER (role: worker)
-  - kustomization.yaml um beide Dateien ergaenzen, committen, pushen
-  - Repo in ArgoCD registrieren (Skip server verification!)
-  - Application '$T7_APP' (Sync Policy: MANUAL), dann manuell syncen
-  - Verifizieren: /etc/motd auf allen Nodes, Permissions 444
+  Verteilen Sie /etc/motd GitOps-getrieben auf ALLE Nodes.
+  Vorgaben:
+    Git-Repo:        $T7_REPO (Credentials laut Lab)
+    Pfad im Repo:    $T7_PATH  (kustomization.yaml ergaenzen!)
+    MOTD-Quelle:     $T7_MOTD_URL
+    Dateien:         ${T7_MC_MASTER}.yaml (role: master)
+                     ${T7_MC_WORKER}.yaml (role: worker)
+    Datei auf Node:  /etc/motd, mode 0444, overwrite: true, base64-Inhalt
+    Ignition:        neueste Version des Clusters (aus MC 00-master)
+    ArgoCD-Repo:     mit 'Skip server verification' registrieren
+    Application:     $T7_APP, Project default,
+                     Path $T7_PATH, Sync Policy MANUAL, danach syncen
+    Verifikation:    /etc/motd auf allen Nodes, Permissions 444
 EOF
 }
 
@@ -529,6 +583,7 @@ ${BOLD}EX380-Trainer - Tasks${NC}
   7  MachineConfig via ArgoCD (motd)         (GitOps + Machine Mgmt)
 
   Beispiele:
+    ./ex380-trainer.sh task 3     # nur Aufgabentext anzeigen
     ./ex380-trainer.sh setup 1
     ./ex380-trainer.sh grade 1
     FORCE=1 ./ex380-trainer.sh setup 5    # destruktiver Reset
@@ -540,6 +595,12 @@ main() {
   local cmd="${1:-}" arg="${2:-}"
   case "$cmd" in
     list|"") list_tasks ;;
+    task)
+      case "$arg" in
+        1|2|3|4|5|6|7) "task_${arg}_text" ;;
+        *) echo "Usage: $0 task <1-7>" >&2; exit 2 ;;
+      esac
+      ;;
     setup)
       need_login
       case "$arg" in
